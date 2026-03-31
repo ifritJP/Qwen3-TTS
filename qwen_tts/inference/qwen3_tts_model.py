@@ -469,7 +469,7 @@ class Qwen3TTSModel:
     @torch.no_grad()
     def generate_voice_clone(
         self,
-        text: Union[str, List[str]],
+        text: Optional[Union[str, List[str]]] = None, # Optionalに変更
         language: Union[str, List[str]] = None,
         ref_audio: Optional[Union[AudioLike, List[AudioLike]]] = None,
         ref_text: Optional[Union[str, List[Optional[str]]]] = None,
@@ -555,7 +555,12 @@ class Qwen3TTSModel:
                 "does not support generate_voice_clone, Please check Model Card or Readme for more details."
             )
         
+        # text が None や空の場合は、無音/ダミートークン用に半角スペース1文字に差し替え
+        if text is None or text == "" or (isinstance(text, list) and not text):
+            text = " "
+            
         texts = self._ensure_list(text)
+# --- L558 in original ---
         languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
         if len(languages) == 1 and len(texts) > 1:
             languages = languages * len(texts)
@@ -601,8 +606,6 @@ class Qwen3TTSModel:
                     ref_ids.append(ref_tok)
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
-        # Debug: confirm state
-        print(f"DEBUG: generate_voice_clone called with return_hidden_states={return_hidden_states}")
         talker_codes_list, talker_hidden_states_list = self.model.generate(
             input_ids=input_ids,
             ref_ids=ref_ids,

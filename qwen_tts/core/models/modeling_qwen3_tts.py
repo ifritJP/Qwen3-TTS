@@ -1676,22 +1676,47 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         ```"""
-        # Prefill
+        import time
+        _start_time = time.time() if enable_anomaly_detection else None
+        target_hidden = None  # 初期化
+        
+        # Prefill / Generate の自動判別とステップ計算
+        # Qwen3-TTS の内部構造に基づき、自ら現在の生成フレーム位置を特定する。
         if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
+            # Prefill フェーズ
+            self._curr_prefill_len = inputs_embeds.shape[1]
             generation_step = -1
-            codec_ids = None
-            _start_time = None
-        # Generate
         else:
-            import time
-            _start_time = time.time()
-            # [Stack Detection / Progress Log] 進捗とスタックを「検出」可能にする
-            if generation_step is not None and generation_step >= 0:
-                if generation_step % 5 == 0:
-                    total_info = ""
-                    if forced_g0_ids is not None:
-                        total_info = f" / {forced_g0_ids.shape[0]}"
-                    print(f" >>> [Talker] Generating flame {generation_step}{total_info} ...", flush=True)
+            # Generation フェーズ
+            if past_key_values is not None:
+                current_seq_len = past_key_values[0][0].shape[2]
+                prefill_len = getattr(self, "_curr_prefill_len", 0)
+                # もし prefill_len が不明な場合は、現在の seq_len を prefill とみなす(初回)か、
+                # 前回の値を継承する。
+                if prefill_len == 0:
+                    self._curr_prefill_len = current_seq_len
+                    generation_step = 0
+                else:
+                    generation_step = current_seq_len - prefill_len
+            else:
+                # KVキャッシュがない状態での 1 トークン入力 (非常に稀)
+                generation_step = 0
+
+        # Debug ログ出力 (生成時のみ)
+        if generation_step >= 0:
+            if generation_step % 5 == 0:
+                total_info = ""
+                if forced_g0_ids is not None:
+                    total_info = f" / {forced_g0_ids.shape[0]}"
+                print(f" >>> [Talker] Generating frame {generation_step}{total_info} ...", flush=True)
+
+        codec_ids = None
+        if generation_step == -1:
+            # Prefill 時の初期化
+            pass
+        else:
+            # Monitoring start time is already set at the method start.
+            pass
 
             # [Semantic Sync Hack] 強制的に状態ベクトルを同期 (Soft Sync)
             # alpha=1.0 で完全同期、値が小さいほどモデルの自律性を優先。
@@ -1714,8 +1739,15 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 else:
                     target_hidden = None
 
+                # [Debug] 同期ステップを追跡 (最初と最後付近)
+                if target_hidden is not None and generation_step in [0, 5, 35]:
+                     print(f" >>> [Debug] sync_alpha={sync_alpha} | Frame={generation_step} -> SourceIndex={idx_to_sync}")
+
                 # 注入: 過去のシーケンス全体を消さず、最後尾 (最新フレーム) だけを同期
                 if target_hidden is not None and past_hidden is not None:
+                    # 型とデバイスを同期
+                    target_hidden = target_hidden.to(device=past_hidden.device, dtype=past_hidden.dtype)
+                    
                     # 最後の 1 トークン分だけを調整することで、シーケンス長を維持しつつ抑揚を誘導
                     past_hidden_latest = past_hidden[:, -1:, :]
                     synced_latest = (1.0 - sync_alpha) * past_hidden_latest + sync_alpha * target_hidden
@@ -1791,29 +1823,43 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         )
 
         hidden_states = outputs.last_hidden_state
+        
+        # [Semantic Sync Hack] 出力側 (生成された最新状態ベクトル) も同期させる
+        # これにより、次のステップへの「記憶」がソースのニュアンスに寄る。
+        if target_hidden is not None:
+             target_hidden_match = target_hidden.to(device=hidden_states.device, dtype=hidden_states.dtype)
+             hidden_states = (1.0 - sync_alpha) * hidden_states + sync_alpha * target_hidden_match
+
         logits = self.codec_head(hidden_states)
 
         if forced_g0_ids is not None:
             # generation_step は -1 (Prefill) から始まる。
-            # Prefill ステップでは 0 番目のトークンを、それ以降(0, 1...)は 1, 2... 番目のトークンを強制する。
             idx_to_force = generation_step + 1
             if idx_to_force >= 0 and idx_to_force < forced_g0_ids.shape[0]:
                 target_id = forced_g0_ids[idx_to_force].item()
                 new_logits = torch.full_like(logits, -1e4)
                 new_logits[:, :, target_id] = 1e4
                 logits = new_logits
+            elif idx_to_force >= forced_g0_ids.shape[0]:
+                # [Fix] ソースが終わったら即座に EOS (2150) を強制してループを防ぐ
+                eos_id = self.config.codec_eos_token_id  # 通常 2150
+                new_logits = torch.full_like(logits, -1e4)
+                new_logits[:, :, eos_id] = 1e4
+                logits = new_logits
 
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        # [Anomaly Detection] 実行時間を測定し、閾値を超えたらアボートさせる
-        if enable_anomaly_detection and "_start_time" in locals() and _start_time is not None:
+        if _start_time is not None:
             _end_time = time.time()
             elapsed = _end_time - _start_time
-            if elapsed > stuck_timeout:
+            # 安全装置：20秒/フレーム、または異常なロングラン (1000フレーム) を検知
+            if elapsed > stuck_timeout or (generation_step is not None and generation_step > 1000):
+                error_msg = f"Frame {generation_step} took {elapsed:.2f}s" if elapsed > stuck_timeout else f"Excessive frames: {generation_step}"
                 raise RuntimeError(
-                    f"\n[CRITICAL ERROR] Anomaly Detected (Condition 1)!\n"
+                    f"\n[CRITICAL ERROR] Anomaly Detected!\n"
+                    f"{error_msg}. Process aborted.\n"
                     f"Frame {generation_step} took {elapsed:.2f}s, exceeding the limit of {stuck_timeout}s.\n"
                     f"Process aborted to prevent resource waste.\n"
                     f"--- Context Info ---\n"
@@ -2139,6 +2185,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        sync_alpha: float = 1.0,
         **kwargs,
     ):
         talker_kwargs = {
@@ -2161,8 +2208,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
                 if i not in (self.config.talker_config.codec_eos_token_id,)
             ],
-            "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
-            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
+            "output_hidden_states": kwargs.get("output_hidden_states", True),
+            "return_dict_in_generate": kwargs.get("return_dict_in_generate", True),
+            "sync_alpha": sync_alpha
         }
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
