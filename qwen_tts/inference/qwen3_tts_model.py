@@ -476,8 +476,10 @@ class Qwen3TTSModel:
         x_vector_only_mode: Union[bool, List[bool]] = False,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[VoiceClonePromptItem]]] = None,
         non_streaming_mode: bool = False,
+        return_hidden_states: bool = False,
+        sync_alpha: float = 1.0, # 新設：同期強度(0.0~1.0)
         **kwargs,
-    ) -> Tuple[List[np.ndarray], int]:
+    ) -> Union[Tuple[List[np.ndarray], int], Tuple[List[np.ndarray], int, List[torch.Tensor]]]:
         """
         Voice clone speech using the Base model.
 
@@ -599,13 +601,15 @@ class Qwen3TTSModel:
                     ref_ids.append(ref_tok)
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
-
-        talker_codes_list, _ = self.model.generate(
+        # Debug: confirm state
+        print(f"DEBUG: generate_voice_clone called with return_hidden_states={return_hidden_states}")
+        talker_codes_list, talker_hidden_states_list = self.model.generate(
             input_ids=input_ids,
             ref_ids=ref_ids,
             voice_clone_prompt=voice_clone_prompt_dict,
             languages=languages,
             non_streaming_mode=non_streaming_mode,
+            sync_alpha=sync_alpha,
             **gen_kwargs,
         )
 
@@ -630,6 +634,9 @@ class Qwen3TTSModel:
             else:
                 wavs_out.append(wav)
 
+        if return_hidden_states:
+            return wavs_out, fs, talker_hidden_states_list
+            
         return wavs_out, fs
 
     # voice design model

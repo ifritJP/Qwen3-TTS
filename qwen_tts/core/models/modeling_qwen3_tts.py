@@ -1343,6 +1343,14 @@ class Qwen3TTSTalkerOutputWithPast(ModelOutput):
     generation_step: Optional[int] = None
     trailing_text_hidden: Optional[torch.FloatTensor] = None
     tts_pad_embed: Optional[torch.FloatTensor] = None
+    forced_g0_ids: Optional[torch.LongTensor] = None
+    forced_past_hiddens: Optional[torch.FloatTensor] = None
+    text_guidance_scale: Optional[float] = 1.0
+    sync_alpha: Optional[float] = 1.0
+
+    def __post_init__(self):
+        # Override ModelOutput.__post_init__ to avoid error with multiple custom fields
+        pass
 
 
 class Qwen3TTSTalkerDecoderLayer(GradientCheckpointingLayer):
@@ -1650,9 +1658,16 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         tts_pad_embed=None,
         generation_step=None,
         subtalker_dosample=None,
-        subtalker_top_p=None,
         subtalker_top_k=None,
+        subtalker_top_p=None,
         subtalker_temperature=None,
+        aligned_frame_map=None,
+        forced_g0_ids=None,
+        forced_past_hiddens=None,
+        sync_alpha=1.0, # 名示的に引数として追加
+        text_guidance_scale=1.0,
+        enable_anomaly_detection=True,
+        stuck_timeout=20.0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1665,8 +1680,47 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
             generation_step = -1
             codec_ids = None
+            _start_time = None
         # Generate
         else:
+            import time
+            _start_time = time.time()
+            # [Stack Detection / Progress Log] 進捗とスタックを「検出」可能にする
+            if generation_step is not None and generation_step >= 0:
+                if generation_step % 5 == 0:
+                    total_info = ""
+                    if forced_g0_ids is not None:
+                        total_info = f" / {forced_g0_ids.shape[0]}"
+                    print(f" >>> [Talker] Generating flame {generation_step}{total_info} ...", flush=True)
+
+            # [Semantic Sync Hack] 強制的に状態ベクトルを同期 (Soft Sync)
+            # alpha=1.0 で完全同期、値が小さいほどモデルの自律性を優先。
+            # generation_step は -1 (Prefill) から始まる。ステップ 0 で生成されるものは 1 番目の隠れ状態に同期。
+            idx_to_sync = generation_step + 1
+            if forced_past_hiddens is not None:
+                # ターゲットの抽出 (1フレーム分)
+                if torch.is_tensor(forced_past_hiddens):
+                    if idx_to_sync >= 0 and idx_to_sync < forced_past_hiddens.shape[1]:
+                        target_hidden = forced_past_hiddens[:, idx_to_sync : idx_to_sync + 1]
+                    else:
+                        target_hidden = None
+                elif isinstance(forced_past_hiddens, list):
+                    if idx_to_sync >= 0 and idx_to_sync < len(forced_past_hiddens):
+                        target_hidden = forced_past_hiddens[idx_to_sync]
+                        if len(target_hidden.shape) == 2:
+                            target_hidden = target_hidden.unsqueeze(1)
+                    else:
+                        target_hidden = None
+                else:
+                    target_hidden = None
+
+                # 注入: 過去のシーケンス全体を消さず、最後尾 (最新フレーム) だけを同期
+                if target_hidden is not None and past_hidden is not None:
+                    # 最後の 1 トークン分だけを調整することで、シーケンス長を維持しつつ抑揚を誘導
+                    past_hidden_latest = past_hidden[:, -1:, :]
+                    synced_latest = (1.0 - sync_alpha) * past_hidden_latest + sync_alpha * target_hidden
+                    past_hidden = torch.cat([past_hidden[:, :-1, :], synced_latest], dim=1)
+
             last_id_hidden = self.get_input_embeddings()(input_ids)
             predictor_result = self.code_predictor.generate(
                 inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
@@ -1686,8 +1740,21 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
-            if generation_step < trailing_text_hidden.shape[1]:
-                inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step].unsqueeze(1)
+
+            if aligned_frame_map is not None:
+                # [Semantic Sync Hack] 物理時刻に基づきテキストコンテキストを選択
+                idx_to_map = generation_step + 1
+                if idx_to_map >= 0 and idx_to_map < len(aligned_frame_map):
+                    idx = aligned_frame_map[idx_to_map]
+                    if idx >= 0 and idx < trailing_text_hidden.shape[1]:
+                        inputs_embeds = inputs_embeds + trailing_text_hidden[:, idx].unsqueeze(1) * text_guidance_scale
+                    else:
+                        inputs_embeds = inputs_embeds + tts_pad_embed
+                else:
+                    inputs_embeds = inputs_embeds + tts_pad_embed
+            elif generation_step < trailing_text_hidden.shape[1]:
+                # 標準モード
+                inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step].unsqueeze(1) * text_guidance_scale
             else:
                 inputs_embeds = inputs_embeds + tts_pad_embed
         if attention_mask is not None:
@@ -1726,10 +1793,33 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         hidden_states = outputs.last_hidden_state
         logits = self.codec_head(hidden_states)
 
+        if forced_g0_ids is not None:
+            # generation_step は -1 (Prefill) から始まる。
+            # Prefill ステップでは 0 番目のトークンを、それ以降(0, 1...)は 1, 2... 番目のトークンを強制する。
+            idx_to_force = generation_step + 1
+            if idx_to_force >= 0 and idx_to_force < forced_g0_ids.shape[0]:
+                target_id = forced_g0_ids[idx_to_force].item()
+                new_logits = torch.full_like(logits, -1e4)
+                new_logits[:, :, target_id] = 1e4
+                logits = new_logits
+
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
+        # [Anomaly Detection] 実行時間を測定し、閾値を超えたらアボートさせる
+        if enable_anomaly_detection and "_start_time" in locals() and _start_time is not None:
+            _end_time = time.time()
+            elapsed = _end_time - _start_time
+            if elapsed > stuck_timeout:
+                raise RuntimeError(
+                    f"\n[CRITICAL ERROR] Anomaly Detected (Condition 1)!\n"
+                    f"Frame {generation_step} took {elapsed:.2f}s, exceeding the limit of {stuck_timeout}s.\n"
+                    f"Process aborted to prevent resource waste.\n"
+                    f"--- Context Info ---\n"
+                    f"Sync_Alpha: {sync_alpha}, Text_Guidance: {text_guidance_scale}\n"
+                    f"--------------------"
+                )
 
         return Qwen3TTSTalkerOutputWithPast(
             loss=loss,
@@ -1741,6 +1831,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             generation_step=generation_step + 1,
             trailing_text_hidden=trailing_text_hidden,
             tts_pad_embed=tts_pad_embed,
+            forced_g0_ids=forced_g0_ids,
+            forced_past_hiddens=forced_past_hiddens,
+            text_guidance_scale=text_guidance_scale,
+            sync_alpha=sync_alpha,
         )
 
     def get_rope_index(
@@ -1807,6 +1901,12 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["generation_step"] = outputs.generation_step
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
+        if "aligned_frame_map" in model_kwargs:
+            model_kwargs["aligned_frame_map"] = model_kwargs["aligned_frame_map"]
+        model_kwargs["forced_g0_ids"] = getattr(outputs, "forced_g0_ids", None)
+        model_kwargs["forced_past_hiddens"] = getattr(outputs, "forced_past_hiddens", None)
+        model_kwargs["text_guidance_scale"] = getattr(outputs, "text_guidance_scale", 1.0)
+        model_kwargs["sync_alpha"] = getattr(outputs, "sync_alpha", 1.0)
         return model_kwargs
 
 
@@ -2269,11 +2369,19 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         trailing_text_hiddens = padded_hiddens
 
         # forward
+        talker_kwargs.update(kwargs)
+        forced_g0_ids = talker_kwargs.pop("forced_g0_ids", None)
+        forced_past_hiddens = talker_kwargs.pop("forced_past_hiddens", None)
+        text_guidance_scale = talker_kwargs.pop("text_guidance_scale", 1.0)
+
         talker_result = self.talker.generate(
             inputs_embeds=talker_input_embeds,
             attention_mask=talker_attention_mask,
             trailing_text_hidden=trailing_text_hiddens,
             tts_pad_embed=tts_pad_embed,
+            forced_g0_ids=forced_g0_ids,
+            forced_past_hiddens=forced_past_hiddens,
+            text_guidance_scale=text_guidance_scale,
             **talker_kwargs,
         )
 
